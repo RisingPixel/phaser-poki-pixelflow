@@ -18,6 +18,8 @@ npm run dev
 
 Open `http://localhost:3000` — you'll see the full scene flow: Boot → Preload → Menu → Game → Result.
 
+For GitHub Pages CI/CD deployment, see [Deployment (GitHub Pages)](#deployment-github-pages).
+
 ## Build for Production
 
 ```bash
@@ -25,6 +27,37 @@ npm run build
 ```
 
 Output goes to `dist/`. Upload the entire `dist/` folder to Poki or any static host.
+
+If you are deploying with GitHub Pages, follow [Deployment (GitHub Pages)](#deployment-github-pages).
+
+## Deployment (GitHub Pages)
+
+This repo includes an Actions workflow that builds and deploys the game to GitHub Pages automatically.
+
+- **Trigger:** On every push to `main`, GitHub Actions runs install + build + deploy.
+- **Workflow file:** `.github/workflows/build` (current workflow filename in this repo; equivalent to `.github/workflows/deploy-pages.yml` if renamed).
+- **Required repo setting:** In your repository, go to **Settings → Pages → Source** and set it to **GitHub Actions**.
+- **Expected build output directory:** `dist/` (uploaded by the workflow as the Pages artifact).
+
+### Troubleshooting failed deploys
+
+If deployment fails:
+
+1. Open the **Actions** tab and inspect logs for the latest `Build & Deploy to GitHub Pages` run.
+2. Verify the build step produces `dist/` (the workflow uploads `./dist`).
+3. Confirm repository permissions/settings allow Pages deploy:
+   - Pages source is set to **GitHub Actions**.
+   - Workflow permissions include `pages: write` and `id-token: write` (already configured in this workflow).
+
+### Optional status badge
+
+You can add a workflow badge near the top of this README:
+
+```md
+![Deploy](https://github.com/<OWNER>/<REPO>/actions/workflows/build/badge.svg)
+```
+
+Replace `<OWNER>` and `<REPO>` with your GitHub org/user and repository name.
 
 ## Project Structure
 
