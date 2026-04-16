@@ -1,3 +1,12 @@
+/**
+ * GameScene.ts — Pixel Cart Puzzle
+ *
+ * Core flow:
+ *   1. selectCart → cart glows, lane buttons light up
+ *   2. clickLane → BFS preview highlights candidate cells
+ *   3. clickLane again → cells fill, score updates, phase-end checked
+ */
+
 import { ScoreSystem } from '../systems/ScoreSystem'
 import { AudioManager } from '../core/AudioManager'
 import { config } from '../core/Config'
@@ -5,579 +14,679 @@ import { GAME_CONFIG } from '../data/gameConfig'
 import { BALANCING } from '../data/balancing'
 import { formatScore } from '../utils/helpers'
 
+// ── Constants ────────────────────────────────────────────────────────────────
 const CX = GAME_CONFIG.width / 2
-const CY = GAME_CONFIG.height / 2
+const CELL_SIZE = 44
+const CELL_GAP  = 3
 
-const COLORS = [
+const PALETTE = [
   0xe74c3c, // Red
   0x4a90d9, // Blue
   0xf1c40f, // Yellow
   0x2ecc71, // Green
-  0x9b59b6  // Purple
 ]
+
+const LANE_ARROWS: Record<Lane, string> = {
+  top:    '▲',
+  bottom: '▼',
+  left:   '◀',
+  right:  '▶',
+}
+
+// ── Types ────────────────────────────────────────────────────────────────────
+type Lane = 'top' | 'bottom' | 'left' | 'right'
 
 interface Cell {
   row: number
   col: number
   color: number
   filled: boolean
-  sprite: Phaser.GameObjects.Sprite
+  gfx: Phaser.GameObjects.Graphics
 }
 
 interface Cart {
   color: number
   capacity: number
   used: boolean
-  uiContainer: Phaser.GameObjects.Container
-  uiBg: Phaser.GameObjects.Graphics
-  uiText: Phaser.GameObjects.Text
+  container: Phaser.GameObjects.Container
+  bg: Phaser.GameObjects.Graphics
+  label: Phaser.GameObjects.Text
 }
 
-type Lane = 'top' | 'bottom' | 'left' | 'right'
-
+// ── Scene ────────────────────────────────────────────────────────────────────
 export class GameScene extends Phaser.Scene {
-  private scoreSystem!: ScoreSystem
 
-  private scoreText!: Phaser.GameObjects.Text
-  private phaseText!: Phaser.GameObjects.Text
+  private score!: ScoreSystem
+
+  // HUD
+  private scoreText!:   Phaser.GameObjects.Text
+  private phaseText!:   Phaser.GameObjects.Text
+  private fillText!:    Phaser.GameObjects.Text
   private messageText!: Phaser.GameObjects.Text
 
-  private currentPhaseIndex: number = 0
-  private isGameOver: boolean = false
-
-  private grid: Cell[][] = []
-  private carts: Cart[] = []
-  
-  private selectedCartIndex: number = -1
+  // State
+  private phaseIndex     = 0
+  private gameOver       = false
+  private selectedCart   = -1
   private selectedLane: Lane | null = null
-  private previewCells: {row: number, col: number}[] = []
+  private previewCells: { row: number; col: number }[] = []
 
-  private gridContainer!: Phaser.GameObjects.Container
+  // Game objects
+  private grid: Cell[][] = []
+  private carts: Cart[]  = []
+
+  // Containers
+  private gridContainer!:  Phaser.GameObjects.Container
   private cartsContainer!: Phaser.GameObjects.Container
-  private laneButtons: { [key in Lane]: Phaser.GameObjects.Sprite } = {} as any
+  private laneContainer!:  Phaser.GameObjects.Container
 
-  constructor() {
-    super({ key: 'GameScene' })
-  }
+  // Lane button graphics refs for highlight/reset
+  private laneBtns: Record<Lane, Phaser.GameObjects.Container> = {} as any
+
+  constructor() { super({ key: 'GameScene' }) }
+
+  // ── Lifecycle ──────────────────────────────────────────────────────────────
 
   create(): void {
     this.cameras.main.setBackgroundColor(config.game.backgroundColor)
     this.cameras.main.fadeIn(BALANCING.sceneFadeDuration, 0, 0, 0)
 
-    this.scoreSystem = new ScoreSystem()
-    this.currentPhaseIndex = 0
-    this.isGameOver = false
+    this.score      = new ScoreSystem()
+    this.phaseIndex = 0
+    this.gameOver   = false
 
+    this.drawBackground()
     this.createHUD()
-    
-    this.gridContainer = this.add.container(CX, CY - 40)
-    this.cartsContainer = this.add.container(CX, GAME_CONFIG.height - 100)
-    
-    this.createLaneButtons()
 
-    this.startPhase(this.currentPhaseIndex)
+    // Create containers (laneContainer is world-space, inside gridContainer)
+    this.gridContainer  = this.add.container(0, 0)
+    this.laneContainer  = this.add.container(0, 0)
+    this.cartsContainer = this.add.container(0, 0)
 
-    // Deselect cart if tapping outside
-    this.input.on('pointerdown', (_pointer: Phaser.Input.Pointer, currentlyOver: any[]) => {
-      // If we clicked on nothing interactive, deselect all
-      if (currentlyOver.length === 0) {
-        this.clearSelection()
-      }
+    this.startPhase(0)
+
+    // Tap on blank space → deselect
+    this.input.on('pointerdown', (_p: Phaser.Input.Pointer, hits: any[]) => {
+      if (hits.length === 0) this.clearSelection()
     })
   }
 
-  // ─── Phase Management ───────────────────────────────────────────────────────
+  // ── Background ─────────────────────────────────────────────────────────────
 
-  private startPhase(index: number): void {
-    if (index >= BALANCING.PHASES.length) {
-      // Game endlessly loops the last phase if players beat the game. Randomness provides replayability.
-      index = BALANCING.PHASES.length - 1;
-    }
-    this.currentPhaseIndex = index
-
-    this.phaseText.setText(`Phase ${index + 1}`)
-    this.messageText.setText('')
-    this.messageText.setAlpha(0)
-
-    this.clearSelection()
-    this.generateGrid()
-    this.generateCarts()
+  private drawBackground(): void {
+    const bg = this.add.graphics()
+    bg.fillGradientStyle(0x1a1a2e, 0x1a1a2e, 0x0f3460, 0x0f3460, 1)
+    bg.fillRect(0, 0, GAME_CONFIG.width, GAME_CONFIG.height)
+    bg.setDepth(-10)
   }
 
-  private generateGrid(): void {
-    // Clear old grid
-    this.gridContainer.removeAll(true)
+  // ── Phase Management ───────────────────────────────────────────────────────
+
+  private startPhase(index: number): void {
+    index = Math.min(index, BALANCING.PHASES.length - 1)
+    this.phaseIndex   = index
+    this.selectedCart = -1
+    this.selectedLane = null
+    this.previewCells = []
+
+    this.phaseText.setText(`Phase ${index + 1} / ${BALANCING.PHASES.length}`)
+    this.messageText.setAlpha(0)
+
+    this.gridContainer.destroy()
+    this.laneContainer.destroy()
+    this.cartsContainer.destroy()
+
+    this.gridContainer  = this.add.container(0, 0)
+    this.laneContainer  = this.add.container(0, 0)
+    this.cartsContainer = this.add.container(0, 0)
+
+    this.buildGrid()
+    this.buildLaneButtons()
+    this.buildCarts()
+    this.updateHUD()
+  }
+
+  // ── Grid ──────────────────────────────────────────────────────────────────
+
+  private buildGrid(): void {
     this.grid = []
+    const phase  = BALANCING.PHASES[this.phaseIndex]
+    const size   = phase.gridSize
+    const colors = PALETTE.slice(0, phase.colors)
 
-    const phaseData = BALANCING.PHASES[this.currentPhaseIndex]
-    const size = phaseData.gridSize
-    const cellSize = 48
-    const spacing = 2
-    const totalW = size * (cellSize + spacing) - spacing
-    const totalH = totalW // square
-
-    const startX = -totalW / 2 + cellSize / 2
-    const startY = -totalH / 2 + cellSize / 2
-
-    // Set colors for this phase
-    const numColors = phaseData.colors
-    const activeColors = COLORS.slice(0, numColors)
+    const step    = CELL_SIZE + CELL_GAP
+    const gridPx  = size * step - CELL_GAP
+    const gridX   = (GAME_CONFIG.width  - gridPx) / 2
+    const gridY   = 90   // top margin (below HUD)
 
     for (let r = 0; r < size; r++) {
       this.grid[r] = []
       for (let c = 0; c < size; c++) {
-        // Randomly pick a color
-        const colorIdx = Phaser.Math.Between(0, activeColors.length - 1)
-        const theColor = activeColors[colorIdx]
+        const color = colors[Phaser.Math.Between(0, colors.length - 1)]
+        const cx = gridX + c * step + CELL_SIZE / 2
+        const cy = gridY + r * step + CELL_SIZE / 2
 
-        const x = startX + c * (cellSize + spacing)
-        const y = startY + r * (cellSize + spacing)
+        const gfx = this.add.graphics()
+        this.drawCell(gfx, color, false, false)
+        gfx.setPosition(cx, cy)
+        this.gridContainer.add(gfx)
 
-        const sprite = this.add.sprite(x, y, 'cell_empty')
-        sprite.setTint(theColor)
-        
-        // Add minimal alpha background for unfilled
-        sprite.setAlpha(0.6)
-
-        this.gridContainer.add(sprite)
-
-        this.grid[r][c] = {
-          row: r,
-          col: c,
-          color: theColor,
-          filled: false,
-          sprite: sprite
-        }
+        this.grid[r][c] = { row: r, col: c, color, filled: false, gfx }
       }
     }
-
-    // Position Lane Buttons around the newly sized grid
-    const margin = 50
-    this.laneButtons['top'].setPosition(0, startY - margin)
-    this.laneButtons['bottom'].setPosition(0, -startY + margin) // startY is negative, so this is positive equivalent
-    this.laneButtons['left'].setPosition(startX - margin, 0)
-    this.laneButtons['right'].setPosition(-startX + margin, 0)
   }
 
-  private generateCarts(): void {
-    // Clear old carts
-    this.cartsContainer.removeAll(true)
-    this.carts = []
+  private drawCell(
+    gfx: Phaser.GameObjects.Graphics,
+    color: number,
+    filled: boolean,
+    preview: boolean
+  ): void {
+    const half = CELL_SIZE / 2
+    const rad  = 6
+    gfx.clear()
 
-    const phaseData = BALANCING.PHASES[this.currentPhaseIndex]
-    const numCarts = phaseData.carts
-    const cartWidth = 70
-    const cartHeight = 50
-    const spacing = 10
-    
-    // We want the carts to fit across the bottom. If too many, scale down or layout differently.
-    // For now we assume they fit horizontally.
-    const totalW = numCarts * cartWidth + (numCarts - 1) * spacing
-    let startX = -totalW / 2 + cartWidth / 2
+    if (filled) {
+      // Bright solid fill
+      gfx.fillStyle(color, 1)
+      gfx.fillRoundedRect(-half, -half, CELL_SIZE, CELL_SIZE, rad)
+      // Inner highlight
+      gfx.fillStyle(0xffffff, 0.15)
+      gfx.fillRoundedRect(-half, -half, CELL_SIZE, CELL_SIZE / 2, rad)
+    } else if (preview) {
+      // Bright outline + translucent fill
+      gfx.fillStyle(color, 0.6)
+      gfx.fillRoundedRect(-half, -half, CELL_SIZE, CELL_SIZE, rad)
+      gfx.lineStyle(3, 0xffffff, 0.9)
+      gfx.strokeRoundedRect(-half, -half, CELL_SIZE, CELL_SIZE, rad)
+    } else {
+      // Empty: colour-coded, dim
+      gfx.fillStyle(color, 0.25)
+      gfx.fillRoundedRect(-half, -half, CELL_SIZE, CELL_SIZE, rad)
+      gfx.lineStyle(2, color, 0.55)
+      gfx.strokeRoundedRect(-half, -half, CELL_SIZE, CELL_SIZE, rad)
+    }
+  }
 
-    // Gather color distributions to give reasonable capacities
-    const colorCounts = new Map<number, number>()
-    for (let r = 0; r < phaseData.gridSize; r++) {
-      for (let c = 0; c < phaseData.gridSize; c++) {
-        const clr = this.grid[r][c].color
-        colorCounts.set(clr, (colorCounts.get(clr) || 0) + 1)
-      }
+  // ── Lane Buttons ──────────────────────────────────────────────────────────
+
+  private buildLaneButtons(): void {
+    const phase  = BALANCING.PHASES[this.phaseIndex]
+    const size   = phase.gridSize
+    const step   = CELL_SIZE + CELL_GAP
+    const gridPx = size * step - CELL_GAP
+    const gridX  = (GAME_CONFIG.width - gridPx) / 2
+    const gridY  = 90
+
+    const cx = gridX + gridPx / 2          // grid centre X
+    const cy = gridY + gridPx / 2          // grid centre Y
+    const pad = 28                          // gap from grid edge to button centre
+
+    const positions: Record<Lane, { x: number; y: number }> = {
+      top:    { x: cx,            y: gridY - pad },
+      bottom: { x: cx,            y: gridY + gridPx + pad },
+      left:   { x: gridX - pad,   y: cy },
+      right:  { x: gridX + gridPx + pad, y: cy },
     }
 
-    const activeColors = Array.from(colorCounts.keys())
+    const isHoriz: Record<Lane, boolean> = {
+      top: false, bottom: false, left: true, right: true
+    }
+
+    ;(Object.keys(positions) as Lane[]).forEach(lane => {
+      const { x, y } = positions[lane]
+      const horiz = isHoriz[lane]
+
+      const btn = this.makeLaneButton(lane, horiz, false)
+      btn.setPosition(x, y)
+      this.laneContainer.add(btn)
+      this.laneBtns[lane] = btn
+    })
+  }
+
+  private makeLaneButton(lane: Lane, horizontal: boolean, active: boolean): Phaser.GameObjects.Container {
+    const W = horizontal ? 36 : 80
+    const H = horizontal ? 60 : 32
+    const container = this.add.container(0, 0)
+
+    const bg = this.add.graphics()
+    this.drawLaneBtn(bg, W, H, active)
+
+    // Arrow text
+    const arrowChar = LANE_ARROWS[lane]
+    const arrow = this.add.text(0, 0, arrowChar, {
+      fontSize: horizontal ? '18px' : '14px',
+      color: '#ffffff',
+      fontFamily: 'Arial, sans-serif',
+      fontStyle: 'bold'
+    }).setOrigin(0.5)
+
+    // Hit area
+    const hit = this.add.rectangle(0, 0, Math.max(W, 48), Math.max(H, 44))
+    hit.setAlpha(0.001)
+    hit.setInteractive({ useHandCursor: true })
+    hit.on('pointerover', () => { if (!active) bg.setAlpha(0.85) })
+    hit.on('pointerout',  () => { bg.setAlpha(1) })
+    hit.on('pointerdown', () => this.onLaneClicked(lane))
+
+    container.add([bg, arrow, hit])
+    return container
+  }
+
+  private drawLaneBtn(bg: Phaser.GameObjects.Graphics, W: number, H: number, active: boolean): void {
+    bg.clear()
+    const col = active ? 0xf1c40f : 0x4a6fa5
+    bg.fillStyle(col, active ? 1 : 0.75)
+    bg.fillRoundedRect(-W / 2, -H / 2, W, H, 8)
+    bg.lineStyle(2, 0xffffff, active ? 0.9 : 0.35)
+    bg.strokeRoundedRect(-W / 2, -H / 2, W, H, 8)
+  }
+
+  private setLaneBtnActive(lane: Lane, active: boolean): void {
+    const btn = this.laneBtns[lane]
+    if (!btn) return
+    const bg = btn.list[0] as Phaser.GameObjects.Graphics
+    const isHoriz = (lane === 'left' || lane === 'right')
+    const W = isHoriz ? 36 : 80
+    const H = isHoriz ? 60 : 32
+    this.drawLaneBtn(bg, W, H, active)
+  }
+
+  // ── Carts Panel ───────────────────────────────────────────────────────────
+
+  private buildCarts(): void {
+    this.carts = []
+    const phase     = BALANCING.PHASES[this.phaseIndex]
+    const numCarts  = phase.carts
+    const cartW     = 64
+    const cartH     = 52
+    const gap       = 8
+    const totalW    = numCarts * cartW + (numCarts - 1) * gap
+    const startX    = (GAME_CONFIG.width - totalW) / 2 + cartW / 2
+    const panelY    = GAME_CONFIG.height - 70
+
+    // Build color distribution map
+    const colorCounts = new Map<number, number>()
+    const size = phase.gridSize
+    for (let r = 0; r < size; r++)
+      for (let c = 0; c < size; c++) {
+        const col = this.grid[r][c].color
+        colorCounts.set(col, (colorCounts.get(col) ?? 0) + 1)
+      }
+
+    const colorList = Array.from(colorCounts.keys())
 
     for (let i = 0; i < numCarts; i++) {
-      // Pick a color for the cart. Weight towards what's still left.
-      const colorSelection = Phaser.Math.Between(0, activeColors.length - 1)
-      const color = activeColors[colorSelection]
-      
-      const maxCount = colorCounts.get(color) || 10
-      // Assign capacity somewhat randomly based on grid size
-      const cap = Phaser.Math.Between(Math.max(1, Math.floor(maxCount * 0.2)), Math.ceil(maxCount * 0.7))
+      const color = colorList[i % colorList.length]
+      const total = colorCounts.get(color) ?? 8
+      const cap   = Phaser.Math.Between(
+        Math.max(1, Math.floor(total * 0.2)),
+        Math.ceil(total * 0.65)
+      )
 
-      const container = this.add.container(startX + i * (cartWidth + spacing), 0)
-      
-      const gfx = this.add.graphics()
-      gfx.fillStyle(color)
-      gfx.fillRoundedRect(-cartWidth/2, -cartHeight/2, cartWidth, cartHeight, 8)
-      gfx.lineStyle(2, 0xffffff, 0)
-      gfx.strokeRoundedRect(-cartWidth/2, -cartHeight/2, cartWidth, cartHeight, 8)
-      
-      const text = this.add.text(0, 0, String(cap), {
-        fontSize: '24px',
-        fontFamily: 'Arial, sans-serif',
-        fontStyle: 'bold',
-        color: '#ffffff'
+      const x = startX + i * (cartW + gap)
+      const container = this.add.container(x, panelY)
+      const bg        = this.add.graphics()
+      this.drawCartBg(bg, color, cartW, cartH, false)
+
+      const label = this.add.text(0, 4, String(cap), {
+        fontSize: '22px', fontFamily: 'Arial, sans-serif',
+        fontStyle: 'bold', color: '#ffffff'
       }).setOrigin(0.5)
 
-      // Hit area for clicking
-      const hitArea = new Phaser.Geom.Rectangle(-cartWidth/2, -cartHeight/2, cartWidth, cartHeight)
-      container.setInteractive(hitArea, Phaser.Geom.Rectangle.Contains)
+      const capLabel = this.add.text(0, -cartH / 2 - 10, '🛒', {
+        fontSize: '14px'
+      }).setOrigin(0.5)
 
-      container.on('pointerdown', () => this.selectCart(i))
+      const hit = this.add.rectangle(0, 0, cartW, cartH)
+      hit.setAlpha(0.001)
+      hit.setInteractive({ useHandCursor: true })
+      hit.on('pointerdown', () => this.selectCart(i))
 
-      container.add([gfx, text])
+      container.add([bg, label, capLabel, hit])
       this.cartsContainer.add(container)
 
-      this.carts.push({
-        color: color,
-        capacity: cap,
-        used: false,
-        uiContainer: container,
-        uiBg: gfx,
-        uiText: text
-      })
+      this.carts.push({ color, capacity: cap, used: false, container, bg, label })
     }
   }
 
-  private createLaneButtons(): void {
-    const createBtn = (lane: Lane) => {
-      const btn = this.add.sprite(0, 0, 'lane_button')
-      btn.setInteractive({ useHandCursor: true })
-      btn.setAlpha(0.5)
-
-      let angle = 0
-      if (lane === 'top') angle = 180
-      else if (lane === 'bottom') angle = 0
-      else if (lane === 'left') angle = 90
-      else if (lane === 'right') angle = 270
-      
-      btn.setAngle(angle) // A little rotation hack, assuming sprite has an arrow pointing up maybe? The placeholder is a solid square right now, but rotation helps if we swap to an arrow.
-
-      btn.on('pointerdown', () => this.onLaneClicked(lane))
-      this.gridContainer.add(btn)
-      return btn
-    }
-
-    this.laneButtons = {
-      'top': createBtn('top'),
-      'bottom': createBtn('bottom'),
-      'left': createBtn('left'),
-      'right': createBtn('right')
+  private drawCartBg(
+    bg: Phaser.GameObjects.Graphics,
+    color: number,
+    w: number, h: number,
+    selected: boolean
+  ): void {
+    bg.clear()
+    bg.fillStyle(color, selected ? 1 : 0.85)
+    bg.fillRoundedRect(-w / 2, -h / 2, w, h, 10)
+    if (selected) {
+      bg.lineStyle(3, 0xffffff, 1)
+      bg.strokeRoundedRect(-w / 2, -h / 2, w, h, 10)
     }
   }
 
-  // ─── Interaction Logic ─────────────────────────────────────────────────────
+  // ── Cart Selection ────────────────────────────────────────────────────────
 
   private selectCart(index: number): void {
-    if (this.isGameOver) return
-    if (this.carts[index].used) return
+    if (this.gameOver || this.carts[index]?.used) return
 
-    AudioManager.playSfx(this, 'sfx_button') // Generic click sound fallback if no sfx_button
-    
-    // Deselect old
-    if (this.selectedCartIndex !== -1) {
-      this.resetCartUI(this.selectedCartIndex)
+    if (this.selectedCart === index) {
+      // Toggle off
+      this.clearSelection()
+      return
     }
 
-    this.selectedCartIndex = index
-    this.selectedLane = null
-    this.previewCells = []
-    this.clearPreviewStyles()
+    // Deselect previous cart
+    if (this.selectedCart !== -1) this.deselectCartUI(this.selectedCart)
 
-    // Highlight new
+    this.clearPreview()
+    this.selectedCart = index
+    this.selectedLane = null
+
     const cart = this.carts[index]
+    this.drawCartBg(cart.bg, cart.color, 64, 52, true)
     this.tweens.add({
-      targets: cart.uiContainer,
-      scaleX: 1.15,
-      scaleY: 1.15,
-      duration: 100,
-      ease: 'Back.easeOut'
+      targets: cart.container, scaleX: 1.12, scaleY: 1.12,
+      duration: 120, ease: 'Back.easeOut'
     })
 
-    cart.uiBg.lineStyle(4, 0xffffff, 1)
-    cart.uiBg.strokeRoundedRect(-35, -25, 70, 50, 8)
+    // Activate all lane buttons
+    ;(Object.keys(this.laneBtns) as Lane[]).forEach(l => this.setLaneBtnActive(l, false))
   }
 
-  private resetCartUI(index: number): void {
+  private deselectCartUI(index: number): void {
     const cart = this.carts[index]
-    this.tweens.killTweensOf(cart.uiContainer)
-    cart.uiContainer.setScale(1)
-    
-    cart.uiBg.clear()
-    cart.uiBg.fillStyle(cart.color)
-    cart.uiBg.fillRoundedRect(-35, -25, 70, 50, 8)
-    cart.uiBg.lineStyle(2, 0xffffff, 0)
-    cart.uiBg.strokeRoundedRect(-35, -25, 70, 50, 8)
+    if (!cart) return
+    this.tweens.killTweensOf(cart.container)
+    cart.container.setScale(1)
+    this.drawCartBg(cart.bg, cart.color, 64, 52, false)
   }
 
   private clearSelection(): void {
-    if (this.selectedCartIndex !== -1) {
-      this.resetCartUI(this.selectedCartIndex)
-      this.selectedCartIndex = -1
-    }
+    if (this.selectedCart !== -1) this.deselectCartUI(this.selectedCart)
+    this.selectedCart = -1
     this.selectedLane = null
-    this.previewCells = []
-    this.clearPreviewStyles()
+    this.clearPreview()
+    ;(Object.keys(this.laneBtns) as Lane[]).forEach(l => this.setLaneBtnActive(l, false))
   }
 
+  // ── Lane Interaction ─────────────────────────────────────────────────────
+
   private onLaneClicked(lane: Lane): void {
-    if (this.isGameOver) return
-    if (this.selectedCartIndex === -1) {
-      this.showMessage("Select a cart first!")
+    if (this.gameOver) return
+    if (this.selectedCart === -1) {
+      this.flash('Select a cart first!')
       return
     }
 
     if (this.selectedLane === lane) {
-      // Confirm fill
-      this.confirmFill()
+      // Confirm
+      this.commitFill()
     } else {
-      // Preview fill
+      // Preview
       this.selectedLane = lane
-      this.updatePreview()
+      ;(Object.keys(this.laneBtns) as Lane[]).forEach(l =>
+        this.setLaneBtnActive(l, l === lane)
+      )
+      this.showPreview(lane)
     }
   }
 
-  private updatePreview(): void {
-    this.clearPreviewStyles()
+  // ── Flood Fill ────────────────────────────────────────────────────────────
 
-    if (this.selectedCartIndex === -1 || !this.selectedLane) return
-    const cart = this.carts[this.selectedCartIndex]
-
-    this.previewCells = this.getFillableCells(cart.color, cart.capacity, this.selectedLane)
-
-    if (this.previewCells.length === 0) {
-      this.showMessage("No valid cells to fill from here!")
-      this.selectedLane = null
-    } else {
-      // Highlight previews
-      this.previewCells.forEach(({row, col}) => {
-        const sprite = this.grid[row][col].sprite
-        sprite.setAlpha(1)
-        // Tint to bright white slightly to show it's selected
-        sprite.setTexture('cell_filled')
-        // sprite.setTint Fill color is already there, but we can animate it or show a dot.
-        // Let's just make alpha 1 and show the solid texture tinted.
-      })
-      this.showMessage("Tap again to confirm fill")
-    }
-  }
-
-  private clearPreviewStyles(): void {
-    if (!this.grid || this.grid.length === 0) return
-    
-    const phaseSize = BALANCING.PHASES[this.currentPhaseIndex].gridSize
-    for (let r = 0; r < phaseSize; r++) {
-      for (let c = 0; c < phaseSize; c++) {
-        const cell = this.grid[r][c]
-        if (!cell.filled) {
-          cell.sprite.setAlpha(0.6)
-          cell.sprite.setTexture('cell_empty')
-        }
-      }
-    }
-  }
-
-  private confirmFill(): void {
-    const cart = this.carts[this.selectedCartIndex]
-    
-    // Fill the cells
-    let filledCount = 0
-    this.previewCells.forEach(({row, col}) => {
-      const cell = this.grid[row][col]
-      cell.filled = true
-      cell.sprite.setTexture('cell_filled')
-      cell.sprite.setAlpha(1)
-      
-      // Spawn particle burst
-      for(let i=0; i<3; i++) {
-        const p = this.add.sprite(this.gridContainer.x + cell.sprite.x, this.gridContainer.y + cell.sprite.y, 'particle')
-        p.setTint(cell.color)
-        this.tweens.add({
-          targets: p,
-          x: p.x + Phaser.Math.Between(-20, 20),
-          y: p.y + Phaser.Math.Between(-20, 20),
-          alpha: 0,
-          duration: 400 + Phaser.Math.Between(0, 200),
-          onComplete: () => p.destroy()
-        })
-      }
-      filledCount++
-    })
-
-    // Consume cart
-    cart.used = true
-    cart.uiContainer.setAlpha(0.2)
-    cart.uiContainer.removeInteractive()
-
-    // Add score
-    this.scoreSystem.add(filledCount * BALANCING.pointsPerCell)
-    this.updateHUD()
-
-    AudioManager.playSfx(this, 'sfx_score') // Default positive sound
-
-    this.clearSelection()
-
-    // Check phase end condition
-    this.checkPhaseEnd()
-  }
-
-  private getFillableCells(color: number, capacity: number, lane: Lane): {row: number, col: number}[] {
-    const phaseConf = BALANCING.PHASES[this.currentPhaseIndex]
-    const size = phaseConf.gridSize
-    const q: {row: number, col: number}[] = []
+  private bfsFlood(color: number, capacity: number, lane: Lane): { row: number; col: number }[] {
+    const size   = BALANCING.PHASES[this.phaseIndex].gridSize
+    const q: { row: number; col: number }[] = []
     const visited = new Set<string>()
-    const result: {row: number, col: number}[] = []
+    const result:  { row: number; col: number }[] = []
 
-    // Add initial cells on the chosen edge
     for (let r = 0; r < size; r++) {
       for (let c = 0; c < size; c++) {
-        if (
-          (lane === 'top' && r === 0) ||
+        const edge =
+          (lane === 'top'    && r === 0) ||
           (lane === 'bottom' && r === size - 1) ||
-          (lane === 'left' && c === 0) ||
-          (lane === 'right' && c === size - 1)
-        ) {
-          if (this.grid[r][c] && this.grid[r][c].color === color && !this.grid[r][c].filled) {
-            q.push({row: r, col: c})
-            visited.add(`${r},${c}`)
-          }
+          (lane === 'left'   && c === 0) ||
+          (lane === 'right'  && c === size - 1)
+        const cell = this.grid[r]?.[c]
+        if (edge && cell && cell.color === color && !cell.filled) {
+          q.push({ row: r, col: c })
+          visited.add(`${r},${c}`)
         }
       }
     }
 
-    // BFS
-    while(q.length > 0 && result.length < capacity) {
-      const curr = q.shift()!
-      result.push(curr)
-
-      const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]]
-      for (const [dr, dc] of dirs) {
-        const nr = curr.row + dr
-        const nc = curr.col + dc
-        if (nr >= 0 && nr < size && nc >= 0 && nc < size) {
-          if (this.grid[nr][nc] && this.grid[nr][nc].color === color && !this.grid[nr][nc].filled && !visited.has(`${nr},${nc}`)) {
-            visited.add(`${nr},${nc}`)
-            q.push({row: nr, col: nc})
-          }
+    while (q.length && result.length < capacity) {
+      const cur = q.shift()!
+      result.push(cur)
+      for (const [dr, dc] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+        const nr = cur.row + dr, nc = cur.col + dc
+        const key = `${nr},${nc}`
+        const ncell = this.grid[nr]?.[nc]
+        if (ncell && ncell.color === color && !ncell.filled && !visited.has(key)) {
+          visited.add(key)
+          q.push({ row: nr, col: nc })
         }
       }
     }
     return result
   }
 
-  private checkPhaseEnd(): void {
-    const phaseConf = BALANCING.PHASES[this.currentPhaseIndex]
-    const size = phaseConf.gridSize
-    const totalCells = size * size
+  private showPreview(lane: Lane): void {
+    this.clearPreview()
+    const cart   = this.carts[this.selectedCart]
+    const cells  = this.bfsFlood(cart.color, cart.capacity, lane)
+    this.previewCells = cells
 
-    let filledCells = 0
-    for (let r = 0; r < size; r++) {
-      for (let c = 0; c < size; c++) {
-        if (this.grid[r][c].filled) filledCells++
-      }
+    if (cells.length === 0) {
+      this.flash('No cells reachable from that lane!')
+      this.selectedLane = null
+      ;(Object.keys(this.laneBtns) as Lane[]).forEach(l => this.setLaneBtnActive(l, false))
+      return
     }
 
-    const fillRatio = filledCells / totalCells
-    const availableCarts = this.carts.filter(c => !c.used)
-
-    if (fillRatio >= phaseConf.targetFill) {
-      // Phase Success
-      const unusedCount = availableCarts.length
-      if (unusedCount > 0) {
-        this.scoreSystem.add(unusedCount * BALANCING.pointsPerUnusedCart)
-      }
-      this.showMessage(`PHASE COMPLETE!\n+${unusedCount * BALANCING.pointsPerUnusedCart} Bonus`, 2000)
-      
-      this.time.delayedCall(2000, () => {
-        this.startPhase(this.currentPhaseIndex + 1)
-      })
-    } else {
-      // Check if literally no moves are left
-      let possibleMoves = false
-      if (availableCarts.length > 0) {
-        for (const cart of availableCarts) {
-          for (const lane of ['top', 'bottom', 'left', 'right'] as Lane[]) {
-            const cells = this.getFillableCells(cart.color, cart.capacity, lane)
-            if (cells.length > 0) {
-              possibleMoves = true
-              break
-            }
-          }
-          if (possibleMoves) break
-        }
-      }
-
-      if (!possibleMoves) {
-        // Game Over
-        this.triggerGameOver()
-      }
-    }
+    cells.forEach(({ row, col }) => {
+      const cell = this.grid[row][col]
+      this.drawCell(cell.gfx, cell.color, false, true)
+    })
+    this.flash(`${cells.length} cells — tap lane again to fill!`)
   }
 
-  // ─── HUD / Effects ────────────────────────────────────────────────────────
+  private clearPreview(): void {
+    this.previewCells.forEach(({ row, col }) => {
+      const cell = this.grid[row]?.[col]
+      if (cell && !cell.filled) this.drawCell(cell.gfx, cell.color, false, false)
+    })
+    this.previewCells = []
+  }
+
+  private commitFill(): void {
+    const cart  = this.carts[this.selectedCart]
+    const cells = this.previewCells.slice()
+
+    cells.forEach(({ row, col }) => {
+      const cell  = this.grid[row][col]
+      cell.filled = true
+      this.drawCell(cell.gfx, cell.color, true, false)
+
+      // Burst particles
+      for (let i = 0; i < 5; i++) {
+        const px = cell.gfx.x + Phaser.Math.Between(-20, 20)
+        const py = cell.gfx.y + Phaser.Math.Between(-20, 20)
+        const dot = this.add.graphics()
+        dot.fillStyle(cell.color, 1)
+        dot.fillCircle(0, 0, Phaser.Math.Between(2, 5))
+        dot.setPosition(cell.gfx.x, cell.gfx.y)
+        this.tweens.add({
+          targets: dot, x: px, y: py, alpha: 0,
+          duration: 350 + Phaser.Math.Between(0, 200),
+          onComplete: () => dot.destroy()
+        })
+      }
+    })
+
+    // Score
+    this.score.add(cells.length * BALANCING.pointsPerCell)
+
+    // Consume cart
+    cart.used = true
+    cart.container.setAlpha(0.3)
+    cart.container.removeInteractive()
+    cart.container.list.forEach(child => {
+      if ('removeInteractive' in child) (child as any).removeInteractive()
+    })
+
+    AudioManager.playSfx(this, 'sfx_score')
+    this.clearSelection()
+    this.updateHUD()
+    this.time.delayedCall(200, () => this.checkPhaseEnd())
+  }
+
+  // ── Phase End ─────────────────────────────────────────────────────────────
+
+  private checkPhaseEnd(): void {
+    const phase = BALANCING.PHASES[this.phaseIndex]
+    const size  = phase.gridSize
+    let filled  = 0, total = size * size
+
+    for (let r = 0; r < size; r++)
+      for (let c = 0; c < size; c++)
+        if (this.grid[r][c].filled) filled++
+
+    const ratio = filled / total
+    this.fillText.setText(`Fill: ${Math.round(ratio * 100)}% / ${Math.round(phase.targetFill * 100)}%`)
+
+    // Success?
+    if (ratio >= phase.targetFill) {
+      const unused = this.carts.filter(c => !c.used).length
+      const bonus  = unused * BALANCING.pointsPerUnusedCart
+      this.score.add(bonus)
+      this.updateHUD()
+
+      this.flash(bonus > 0
+        ? `Phase Complete! +${bonus} cart bonus 🎉`
+        : `Phase Complete! 🎉`, 2200
+      )
+      // Phase-complete grid pulse
+      this.tweens.add({
+        targets: this.gridContainer, alpha: 0.3,
+        yoyo: true, repeat: 2, duration: 180,
+        onComplete: () => {
+          this.time.delayedCall(1000, () => this.startPhase(this.phaseIndex + 1))
+        }
+      })
+      return
+    }
+
+    // No moves left?
+    const remaining = this.carts.filter(c => !c.used)
+    let hasMoves    = false
+    for (const cart of remaining) {
+      if (hasMoves) break
+      for (const lane of ['top', 'bottom', 'left', 'right'] as Lane[]) {
+        if (this.bfsFlood(cart.color, cart.capacity, lane).length > 0) {
+          hasMoves = true; break
+        }
+      }
+    }
+
+    if (!hasMoves) this.triggerGameOver()
+  }
+
+  // ── HUD ────────────────────────────────────────────────────────────────────
 
   private createHUD(): void {
-    this.scoreText = this.add.text(CX, 30, 'Score: 0', {
-      fontSize: '22px',
-      fontFamily: 'Arial, sans-serif',
-      color: '#ffffff',
-      fontStyle: 'bold'
-    }).setOrigin(0.5, 0).setDepth(20)
+    // Gradient top bar
+    const bar = this.add.graphics()
+    bar.fillGradientStyle(0x000000, 0x000000, 0x000000, 0x000000, 0.6, 0.6, 0, 0)
+    bar.fillRect(0, 0, GAME_CONFIG.width, 72)
+    bar.setDepth(15)
 
-    this.phaseText = this.add.text(16, 16, 'Phase 1', {
-      fontSize: '20px',
-      fontFamily: 'Arial, sans-serif',
-      color: '#e74c3c'
+    this.phaseText = this.add.text(16, 14, '', {
+      fontSize: '18px', fontFamily: 'Arial, sans-serif',
+      color: '#e0e0ff', fontStyle: 'bold'
     }).setDepth(20)
 
-    this.messageText = this.add.text(CX, CY, '', {
-      fontSize: '24px',
-      fontFamily: 'Arial, sans-serif',
-      color: '#f1c40f',
-      fontStyle: 'bold',
-      align: 'center'
-    }).setOrigin(0.5).setDepth(30).setAlpha(0)
+    this.scoreText = this.add.text(CX, 14, 'Score: 0', {
+      fontSize: '20px', fontFamily: 'Arial, sans-serif',
+      color: '#ffffff', fontStyle: 'bold'
+    }).setOrigin(0.5, 0).setDepth(20)
 
-    // Pause functionality could be preserved if wanted, but removing here for puzzle simplicity.
+    this.fillText = this.add.text(GAME_CONFIG.width - 16, 14, 'Fill: 0%', {
+      fontSize: '16px', fontFamily: 'Arial, sans-serif',
+      color: '#aaaacc'
+    }).setOrigin(1, 0).setDepth(20)
+
+    // Mute button
+    const mute = this.add.text(GAME_CONFIG.width - 16, 46, AudioManager.muted ? '🔇' : '🔊', {
+      fontSize: '24px'
+    }).setOrigin(1, 0).setDepth(20).setInteractive({ useHandCursor: true })
+    mute.on('pointerdown', () => {
+      AudioManager.toggleMute()
+      mute.setText(AudioManager.muted ? '🔇' : '🔊')
+    })
+
+    // Bottom bar
+    const bbar = this.add.graphics()
+    bbar.fillGradientStyle(0x000000, 0x000000, 0x000000, 0x000000, 0, 0, 0.7, 0.7)
+    bbar.fillRect(0, GAME_CONFIG.height - 110, GAME_CONFIG.width, 110)
+    bbar.setDepth(15)
+
+    this.messageText = this.add.text(CX, GAME_CONFIG.height / 2, '', {
+      fontSize: '22px', fontFamily: 'Arial, sans-serif',
+      color: '#f1c40f', fontStyle: 'bold', align: 'center',
+      wordWrap: { width: GAME_CONFIG.width - 40 }
+    }).setOrigin(0.5).setDepth(30).setAlpha(0)
   }
 
   private updateHUD(): void {
-    this.scoreText.setText(`Score: ${formatScore(this.scoreSystem.getScore())}`)
+    this.scoreText.setText(`Score: ${formatScore(this.score.getScore())}`)
+    const phase = BALANCING.PHASES[this.phaseIndex]
+    const size  = phase.gridSize
+    let filled  = 0
+    for (let r = 0; r < size; r++)
+      for (let c = 0; c < size; c++)
+        if (this.grid[r]?.[c]?.filled) filled++
+    const pct = Math.round(filled / (size * size) * 100)
+    this.fillText.setText(`Fill: ${pct}% / ${Math.round(phase.targetFill * 100)}%`)
   }
 
-  private showMessage(msg: string, duration: number = 1000): void {
-    this.messageText.setText(msg)
-    this.messageText.setAlpha(1)
-    this.messageText.setScale(0.8)
+  // ── Message Flash ─────────────────────────────────────────────────────────
 
+  private flash(msg: string, duration = 1200): void {
+    this.messageText.setText(msg).setAlpha(1).setScale(0.85)
     this.tweens.killTweensOf(this.messageText)
     this.tweens.add({
-      targets: this.messageText,
-      scale: 1,
-      duration: 200,
-      ease: 'Back.easeOut',
+      targets: this.messageText, scale: 1,
+      duration: 200, ease: 'Back.easeOut',
       onComplete: () => {
         this.tweens.add({
           targets: this.messageText,
-          alpha: 0,
-          delay: duration,
-          duration: 300
+          alpha: 0, delay: duration, duration: 300
         })
       }
     })
   }
 
-  // ─── Game Over ────────────────────────────────────────────────────────────
+  // ── Game Over ─────────────────────────────────────────────────────────────
 
   private triggerGameOver(): void {
-    if (this.isGameOver) return;
-    this.isGameOver = true
-
-    this.showMessage("NO MOVES LEFT!", 2000)
-
-    this.cameras.main.shake(300, 0.012)
-    this.time.delayedCall(2000, () => {
+    if (this.gameOver) return
+    this.gameOver = true
+    this.flash('NO MOVES LEFT!', 2500)
+    this.cameras.main.shake(300, 0.01)
+    this.time.delayedCall(2800, () => {
       this.cameras.main.fadeOut(BALANCING.sceneFadeDuration, 0, 0, 0)
       this.cameras.main.once(Phaser.Cameras.Scene2D.Events.FADE_OUT_COMPLETE, () => {
         this.scene.start('ResultScene', {
-          score: this.scoreSystem.getScore(),
-          highScore: this.scoreSystem.getHighScore(),
-          isNewHighScore: this.scoreSystem.isNewHighScore()
+          score:          this.score.getScore(),
+          highScore:      this.score.getHighScore(),
+          isNewHighScore: this.score.isNewHighScore()
         })
       })
     })
   }
+
+  // ── Cleanup ───────────────────────────────────────────────────────────────
 
   shutdown(): void {
     this.input.off('pointerdown')
