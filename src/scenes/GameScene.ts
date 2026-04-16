@@ -1,29 +1,4 @@
-/**
- * GameScene.ts
- * Core gameplay scene — placeholder loop with all systems wired up.
- *
- * Poki: PokiPlugin automatically fires gameplayStart when this scene
- * starts and gameplayStop when it stops. No manual SDK calls needed
- * for those events.
- *
- * ── What's implemented (placeholder) ────────────────────────────────────────
- *   • Player sprite controlled by touch/mouse drag or keyboard arrows
- *   • Enemies spawn from the top, fall downward
- *   • Collision with enemy → lose a life → game over
- *   • Coins spawn periodically → collect for points
- *   • Score and lives HUD
- *   • Pause on Escape key
- *
- * ── What to replace for your specific game ──────────────────────────────────
- *   • Player movement logic
- *   • SpawnSystem callbacks (create your actual game objects)
- *   • Collision handlers
- *   • Win/lose conditions
- */
-
 import { ScoreSystem } from '../systems/ScoreSystem'
-import { DifficultySystem } from '../systems/DifficultySystem'
-import { SpawnSystem } from '../systems/SpawnSystem'
 import { AudioManager } from '../core/AudioManager'
 import { config } from '../core/Config'
 import { GAME_CONFIG } from '../data/gameConfig'
@@ -31,422 +6,581 @@ import { BALANCING } from '../data/balancing'
 import { formatScore } from '../utils/helpers'
 
 const CX = GAME_CONFIG.width / 2
+const CY = GAME_CONFIG.height / 2
+
+const COLORS = [
+  0xe74c3c, // Red
+  0x4a90d9, // Blue
+  0xf1c40f, // Yellow
+  0x2ecc71, // Green
+  0x9b59b6  // Purple
+]
+
+interface Cell {
+  row: number
+  col: number
+  color: number
+  filled: boolean
+  sprite: Phaser.GameObjects.Sprite
+}
+
+interface Cart {
+  color: number
+  capacity: number
+  used: boolean
+  uiContainer: Phaser.GameObjects.Container
+  uiBg: Phaser.GameObjects.Graphics
+  uiText: Phaser.GameObjects.Text
+}
+
+type Lane = 'top' | 'bottom' | 'left' | 'right'
 
 export class GameScene extends Phaser.Scene {
-  // ── Systems ────────────────────────────────────────────────────────────────
   private scoreSystem!: ScoreSystem
-  private difficultySystem!: DifficultySystem
-  private spawnSystem!: SpawnSystem
 
-  // ── Game Objects ──────────────────────────────────────────────────────────
-  private player!: Phaser.Physics.Arcade.Sprite
-  private enemies!: Phaser.Physics.Arcade.Group
-  private coins!: Phaser.Physics.Arcade.Group
-
-  // ── HUD ───────────────────────────────────────────────────────────────────
   private scoreText!: Phaser.GameObjects.Text
-  private livesText!: Phaser.GameObjects.Text
-  private pauseOverlay!: Phaser.GameObjects.Container
+  private phaseText!: Phaser.GameObjects.Text
+  private messageText!: Phaser.GameObjects.Text
 
-  // ── State ─────────────────────────────────────────────────────────────────
-  private lives: number = BALANCING.startingLives
-  private isPaused: boolean = false
+  private currentPhaseIndex: number = 0
   private isGameOver: boolean = false
 
-  // ── Input ─────────────────────────────────────────────────────────────────
-  private cursors!: Phaser.Types.Input.Keyboard.CursorKeys
-  private wasdKeys!: {
-    up: Phaser.Input.Keyboard.Key
-    down: Phaser.Input.Keyboard.Key
-    left: Phaser.Input.Keyboard.Key
-    right: Phaser.Input.Keyboard.Key
-  }
-  private escapeKey!: Phaser.Input.Keyboard.Key
-  private pointerX: number = CX
-  private pointerDown: boolean = false
+  private grid: Cell[][] = []
+  private carts: Cart[] = []
+  
+  private selectedCartIndex: number = -1
+  private selectedLane: Lane | null = null
+  private previewCells: {row: number, col: number}[] = []
 
-  // ── Spawn Entries (kept to update interval dynamically) ───────────────────
-  private enemySpawnEntry!: ReturnType<SpawnSystem['schedule']>
-  private coinSpawnEntry!: ReturnType<SpawnSystem['schedule']>
+  private gridContainer!: Phaser.GameObjects.Container
+  private cartsContainer!: Phaser.GameObjects.Container
+  private laneButtons: { [key in Lane]: Phaser.GameObjects.Sprite } = {} as any
 
   constructor() {
     super({ key: 'GameScene' })
   }
 
-  // ─── Lifecycle ─────────────────────────────────────────────────────────────
-
   create(): void {
     this.cameras.main.setBackgroundColor(config.game.backgroundColor)
     this.cameras.main.fadeIn(BALANCING.sceneFadeDuration, 0, 0, 0)
 
-    // Reset state
-    this.lives = BALANCING.startingLives
-    this.isPaused = false
+    this.scoreSystem = new ScoreSystem()
+    this.currentPhaseIndex = 0
     this.isGameOver = false
 
-    // Init systems
-    this.scoreSystem = new ScoreSystem()
-    this.difficultySystem = new DifficultySystem()
-    this.spawnSystem = new SpawnSystem()
-
-    this.createWorld()
-    this.createPlayer()
-    this.createGroups()
     this.createHUD()
-    this.createPauseOverlay()
-    this.setupPhysics()
-    this.setupInput()
-    this.setupSpawning()
+    
+    this.gridContainer = this.add.container(CX, CY - 40)
+    this.cartsContainer = this.add.container(CX, GAME_CONFIG.height - 100)
+    
+    this.createLaneButtons()
 
-    // TODO: analytics hook — gameplay_started
+    this.startPhase(this.currentPhaseIndex)
+
+    // Deselect cart if tapping outside
+    this.input.on('pointerdown', (_pointer: Phaser.Input.Pointer, currentlyOver: any[]) => {
+      // If we clicked on nothing interactive, deselect all
+      if (currentlyOver.length === 0) {
+        this.clearSelection()
+      }
+    })
   }
 
-  update(_time: number, delta: number): void {
-    if (this.isGameOver || this.isPaused) return
+  // ─── Phase Management ───────────────────────────────────────────────────────
 
-    this.difficultySystem.update(delta)
+  private startPhase(index: number): void {
+    if (index >= BALANCING.PHASES.length) {
+      // Game endlessly loops the last phase if players beat the game. Randomness provides replayability.
+      index = BALANCING.PHASES.length - 1;
+    }
+    this.currentPhaseIndex = index
 
-    // Dynamically update spawn intervals based on current difficulty
-    this.enemySpawnEntry.intervalMs = this.difficultySystem.getCurrentSpawnInterval()
-    this.coinSpawnEntry.intervalMs = this.difficultySystem.getCurrentSpawnInterval() * 1.5
+    this.phaseText.setText(`Phase ${index + 1}`)
+    this.messageText.setText('')
+    this.messageText.setAlpha(0)
 
-    this.spawnSystem.tick(delta)
-    this.updatePlayerMovement()
-    this.cleanupOffscreenObjects()
+    this.clearSelection()
+    this.generateGrid()
+    this.generateCarts()
   }
 
-  // ─── World ────────────────────────────────────────────────────────────────
+  private generateGrid(): void {
+    // Clear old grid
+    this.gridContainer.removeAll(true)
+    this.grid = []
 
-  private createWorld(): void {
-    // Gradient background (replace with tilemaps / parallax layers)
-    const bg = this.add.graphics()
-    bg.fillGradientStyle(0x1a1a2e, 0x1a1a2e, 0x16213e, 0x16213e, 1)
-    bg.fillRect(0, 0, GAME_CONFIG.width, GAME_CONFIG.height)
-    bg.setDepth(0)
-  }
+    const phaseData = BALANCING.PHASES[this.currentPhaseIndex]
+    const size = phaseData.gridSize
+    const cellSize = 48
+    const spacing = 2
+    const totalW = size * (cellSize + spacing) - spacing
+    const totalH = totalW // square
 
-  // ─── Player ───────────────────────────────────────────────────────────────
+    const startX = -totalW / 2 + cellSize / 2
+    const startY = -totalH / 2 + cellSize / 2
 
-  private createPlayer(): void {
-    const spawnX = CX
-    const spawnY = GAME_CONFIG.height - 120
+    // Set colors for this phase
+    const numColors = phaseData.colors
+    const activeColors = COLORS.slice(0, numColors)
 
-    this.player = this.physics.add.sprite(spawnX, spawnY, 'player')
-    this.player.setCollideWorldBounds(true)
-    this.player.setDepth(10)
+    for (let r = 0; r < size; r++) {
+      this.grid[r] = []
+      for (let c = 0; c < size; c++) {
+        // Randomly pick a color
+        const colorIdx = Phaser.Math.Between(0, activeColors.length - 1)
+        const theColor = activeColors[colorIdx]
 
-    // Constrain player to bottom third of screen vertically
-    this.player.setMaxVelocity(BALANCING.playerSpeed, 0)
-  }
+        const x = startX + c * (cellSize + spacing)
+        const y = startY + r * (cellSize + spacing)
 
-  private updatePlayerMovement(): void {
-    const speed = BALANCING.playerSpeed
-    let vx = 0
+        const sprite = this.add.sprite(x, y, 'cell_empty')
+        sprite.setTint(theColor)
+        
+        // Add minimal alpha background for unfilled
+        sprite.setAlpha(0.6)
 
-    // ── Keyboard ────────────────────────────────────────────────────────────
-    const leftDown =
-      this.cursors.left.isDown || this.wasdKeys.left.isDown
-    const rightDown =
-      this.cursors.right.isDown || this.wasdKeys.right.isDown
+        this.gridContainer.add(sprite)
 
-    if (leftDown) vx = -speed
-    else if (rightDown) vx = speed
-
-    // ── Touch / Pointer ──────────────────────────────────────────────────────
-    if (this.pointerDown && !leftDown && !rightDown) {
-      const diff = this.pointerX - this.player.x
-      if (Math.abs(diff) > 8) {
-        vx = Math.sign(diff) * speed
+        this.grid[r][c] = {
+          row: r,
+          col: c,
+          color: theColor,
+          filled: false,
+          sprite: sprite
+        }
       }
     }
 
-    this.player.setVelocityX(vx)
+    // Position Lane Buttons around the newly sized grid
+    const margin = 50
+    this.laneButtons['top'].setPosition(0, startY - margin)
+    this.laneButtons['bottom'].setPosition(0, -startY + margin) // startY is negative, so this is positive equivalent
+    this.laneButtons['left'].setPosition(startX - margin, 0)
+    this.laneButtons['right'].setPosition(-startX + margin, 0)
   }
 
-  // ─── Groups ───────────────────────────────────────────────────────────────
+  private generateCarts(): void {
+    // Clear old carts
+    this.cartsContainer.removeAll(true)
+    this.carts = []
 
-  private createGroups(): void {
-    this.enemies = this.physics.add.group({
-      maxSize: 30,
-      runChildUpdate: false
-    })
+    const phaseData = BALANCING.PHASES[this.currentPhaseIndex]
+    const numCarts = phaseData.carts
+    const cartWidth = 70
+    const cartHeight = 50
+    const spacing = 10
+    
+    // We want the carts to fit across the bottom. If too many, scale down or layout differently.
+    // For now we assume they fit horizontally.
+    const totalW = numCarts * cartWidth + (numCarts - 1) * spacing
+    let startX = -totalW / 2 + cartWidth / 2
 
-    this.coins = this.physics.add.group({
-      maxSize: 10,
-      runChildUpdate: false
-    })
+    // Gather color distributions to give reasonable capacities
+    const colorCounts = new Map<number, number>()
+    for (let r = 0; r < phaseData.gridSize; r++) {
+      for (let c = 0; c < phaseData.gridSize; c++) {
+        const clr = this.grid[r][c].color
+        colorCounts.set(clr, (colorCounts.get(clr) || 0) + 1)
+      }
+    }
+
+    const activeColors = Array.from(colorCounts.keys())
+
+    for (let i = 0; i < numCarts; i++) {
+      // Pick a color for the cart. Weight towards what's still left.
+      const colorSelection = Phaser.Math.Between(0, activeColors.length - 1)
+      const color = activeColors[colorSelection]
+      
+      const maxCount = colorCounts.get(color) || 10
+      // Assign capacity somewhat randomly based on grid size
+      const cap = Phaser.Math.Between(Math.max(1, Math.floor(maxCount * 0.2)), Math.ceil(maxCount * 0.7))
+
+      const container = this.add.container(startX + i * (cartWidth + spacing), 0)
+      
+      const gfx = this.add.graphics()
+      gfx.fillStyle(color)
+      gfx.fillRoundedRect(-cartWidth/2, -cartHeight/2, cartWidth, cartHeight, 8)
+      gfx.lineStyle(2, 0xffffff, 0)
+      gfx.strokeRoundedRect(-cartWidth/2, -cartHeight/2, cartWidth, cartHeight, 8)
+      
+      const text = this.add.text(0, 0, String(cap), {
+        fontSize: '24px',
+        fontFamily: 'Arial, sans-serif',
+        fontStyle: 'bold',
+        color: '#ffffff'
+      }).setOrigin(0.5)
+
+      // Hit area for clicking
+      const hitArea = new Phaser.Geom.Rectangle(-cartWidth/2, -cartHeight/2, cartWidth, cartHeight)
+      container.setInteractive(hitArea, Phaser.Geom.Rectangle.Contains)
+
+      container.on('pointerdown', () => this.selectCart(i))
+
+      container.add([gfx, text])
+      this.cartsContainer.add(container)
+
+      this.carts.push({
+        color: color,
+        capacity: cap,
+        used: false,
+        uiContainer: container,
+        uiBg: gfx,
+        uiText: text
+      })
+    }
   }
 
-  // ─── Physics / Collisions ─────────────────────────────────────────────────
+  private createLaneButtons(): void {
+    const createBtn = (lane: Lane) => {
+      const btn = this.add.sprite(0, 0, 'lane_button')
+      btn.setInteractive({ useHandCursor: true })
+      btn.setAlpha(0.5)
 
-  private setupPhysics(): void {
-    // Player ↔ Enemy
-    this.physics.add.overlap(
-      this.player,
-      this.enemies,
-      this.handlePlayerHitEnemy as Phaser.Types.Physics.Arcade.ArcadePhysicsCallback,
-      undefined,
-      this
-    )
+      let angle = 0
+      if (lane === 'top') angle = 180
+      else if (lane === 'bottom') angle = 0
+      else if (lane === 'left') angle = 90
+      else if (lane === 'right') angle = 270
+      
+      btn.setAngle(angle) // A little rotation hack, assuming sprite has an arrow pointing up maybe? The placeholder is a solid square right now, but rotation helps if we swap to an arrow.
 
-    // Player ↔ Coin
-    this.physics.add.overlap(
-      this.player,
-      this.coins,
-      this.handlePlayerCollectCoin as Phaser.Types.Physics.Arcade.ArcadePhysicsCallback,
-      undefined,
-      this
-    )
+      btn.on('pointerdown', () => this.onLaneClicked(lane))
+      this.gridContainer.add(btn)
+      return btn
+    }
+
+    this.laneButtons = {
+      'top': createBtn('top'),
+      'bottom': createBtn('bottom'),
+      'left': createBtn('left'),
+      'right': createBtn('right')
+    }
   }
 
-  private handlePlayerHitEnemy(
-    _player: Phaser.GameObjects.GameObject,
-    enemy: Phaser.GameObjects.GameObject
-  ): void {
-    enemy.destroy()
-    this.lives--
-    this.updateHUD()
+  // ─── Interaction Logic ─────────────────────────────────────────────────────
 
-    // Flash the player red
+  private selectCart(index: number): void {
+    if (this.isGameOver) return
+    if (this.carts[index].used) return
+
+    AudioManager.playSfx(this, 'sfx_button') // Generic click sound fallback if no sfx_button
+    
+    // Deselect old
+    if (this.selectedCartIndex !== -1) {
+      this.resetCartUI(this.selectedCartIndex)
+    }
+
+    this.selectedCartIndex = index
+    this.selectedLane = null
+    this.previewCells = []
+    this.clearPreviewStyles()
+
+    // Highlight new
+    const cart = this.carts[index]
     this.tweens.add({
-      targets: this.player,
-      alpha: 0.3,
-      duration: 80,
-      yoyo: true,
-      repeat: 3,
-      onComplete: () => this.player.setAlpha(1)
+      targets: cart.uiContainer,
+      scaleX: 1.15,
+      scaleY: 1.15,
+      duration: 100,
+      ease: 'Back.easeOut'
     })
 
-    AudioManager.playSfx(this, 'sfx_hurt')
+    cart.uiBg.lineStyle(4, 0xffffff, 1)
+    cart.uiBg.strokeRoundedRect(-35, -25, 70, 50, 8)
+  }
 
-    if (this.lives <= 0) {
-      this.triggerGameOver()
+  private resetCartUI(index: number): void {
+    const cart = this.carts[index]
+    this.tweens.killTweensOf(cart.uiContainer)
+    cart.uiContainer.setScale(1)
+    
+    cart.uiBg.clear()
+    cart.uiBg.fillStyle(cart.color)
+    cart.uiBg.fillRoundedRect(-35, -25, 70, 50, 8)
+    cart.uiBg.lineStyle(2, 0xffffff, 0)
+    cart.uiBg.strokeRoundedRect(-35, -25, 70, 50, 8)
+  }
+
+  private clearSelection(): void {
+    if (this.selectedCartIndex !== -1) {
+      this.resetCartUI(this.selectedCartIndex)
+      this.selectedCartIndex = -1
+    }
+    this.selectedLane = null
+    this.previewCells = []
+    this.clearPreviewStyles()
+  }
+
+  private onLaneClicked(lane: Lane): void {
+    if (this.isGameOver) return
+    if (this.selectedCartIndex === -1) {
+      this.showMessage("Select a cart first!")
+      return
+    }
+
+    if (this.selectedLane === lane) {
+      // Confirm fill
+      this.confirmFill()
+    } else {
+      // Preview fill
+      this.selectedLane = lane
+      this.updatePreview()
     }
   }
 
-  private handlePlayerCollectCoin(
-    _player: Phaser.GameObjects.GameObject,
-    coin: Phaser.GameObjects.GameObject
-  ): void {
-    coin.destroy()
-    this.scoreSystem.add(BALANCING.pointsPerEvent)
+  private updatePreview(): void {
+    this.clearPreviewStyles()
+
+    if (this.selectedCartIndex === -1 || !this.selectedLane) return
+    const cart = this.carts[this.selectedCartIndex]
+
+    this.previewCells = this.getFillableCells(cart.color, cart.capacity, this.selectedLane)
+
+    if (this.previewCells.length === 0) {
+      this.showMessage("No valid cells to fill from here!")
+      this.selectedLane = null
+    } else {
+      // Highlight previews
+      this.previewCells.forEach(({row, col}) => {
+        const sprite = this.grid[row][col].sprite
+        sprite.setAlpha(1)
+        // Tint to bright white slightly to show it's selected
+        sprite.setTexture('cell_filled')
+        // sprite.setTint Fill color is already there, but we can animate it or show a dot.
+        // Let's just make alpha 1 and show the solid texture tinted.
+      })
+      this.showMessage("Tap again to confirm fill")
+    }
+  }
+
+  private clearPreviewStyles(): void {
+    if (!this.grid || this.grid.length === 0) return
+    
+    const phaseSize = BALANCING.PHASES[this.currentPhaseIndex].gridSize
+    for (let r = 0; r < phaseSize; r++) {
+      for (let c = 0; c < phaseSize; c++) {
+        const cell = this.grid[r][c]
+        if (!cell.filled) {
+          cell.sprite.setAlpha(0.6)
+          cell.sprite.setTexture('cell_empty')
+        }
+      }
+    }
+  }
+
+  private confirmFill(): void {
+    const cart = this.carts[this.selectedCartIndex]
+    
+    // Fill the cells
+    let filledCount = 0
+    this.previewCells.forEach(({row, col}) => {
+      const cell = this.grid[row][col]
+      cell.filled = true
+      cell.sprite.setTexture('cell_filled')
+      cell.sprite.setAlpha(1)
+      
+      // Spawn particle burst
+      for(let i=0; i<3; i++) {
+        const p = this.add.sprite(this.gridContainer.x + cell.sprite.x, this.gridContainer.y + cell.sprite.y, 'particle')
+        p.setTint(cell.color)
+        this.tweens.add({
+          targets: p,
+          x: p.x + Phaser.Math.Between(-20, 20),
+          y: p.y + Phaser.Math.Between(-20, 20),
+          alpha: 0,
+          duration: 400 + Phaser.Math.Between(0, 200),
+          onComplete: () => p.destroy()
+        })
+      }
+      filledCount++
+    })
+
+    // Consume cart
+    cart.used = true
+    cart.uiContainer.setAlpha(0.2)
+    cart.uiContainer.removeInteractive()
+
+    // Add score
+    this.scoreSystem.add(filledCount * BALANCING.pointsPerCell)
     this.updateHUD()
 
-    AudioManager.playSfx(this, 'sfx_score')
+    AudioManager.playSfx(this, 'sfx_score') // Default positive sound
 
-    // TODO: analytics hook — coin_collected, score: this.scoreSystem.getScore()
+    this.clearSelection()
+
+    // Check phase end condition
+    this.checkPhaseEnd()
   }
 
-  // ─── Spawning ─────────────────────────────────────────────────────────────
+  private getFillableCells(color: number, capacity: number, lane: Lane): {row: number, col: number}[] {
+    const phaseConf = BALANCING.PHASES[this.currentPhaseIndex]
+    const size = phaseConf.gridSize
+    const q: {row: number, col: number}[] = []
+    const visited = new Set<string>()
+    const result: {row: number, col: number}[] = []
 
-  private setupSpawning(): void {
-    // Enemy spawner
-    this.enemySpawnEntry = this.spawnSystem.schedule(
-      () => this.spawnEnemy(),
-      BALANCING.initialSpawnInterval
-    )
-
-    // Coin spawner (less frequent than enemies)
-    this.coinSpawnEntry = this.spawnSystem.schedule(
-      () => this.spawnCoin(),
-      BALANCING.initialSpawnInterval * 1.5
-    )
-  }
-
-  private spawnEnemy(): void {
-    const x = Phaser.Math.Between(30, GAME_CONFIG.width - 30)
-    const enemy = this.enemies.get(x, -20, 'enemy') as Phaser.Physics.Arcade.Sprite | null
-    if (!enemy) return
-
-    enemy.setActive(true)
-    enemy.setVisible(true)
-    enemy.setPosition(x, -20)
-    enemy.setDepth(5)
-
-    const speed = 150 + this.difficultySystem.getDifficultyMultiplier() * 50
-    enemy.setVelocityY(speed)
-    enemy.setVelocityX(Phaser.Math.Between(-40, 40))
-  }
-
-  private spawnCoin(): void {
-    const x = Phaser.Math.Between(30, GAME_CONFIG.width - 30)
-    const coin = this.coins.get(x, -20, 'coin') as Phaser.Physics.Arcade.Sprite | null
-    if (!coin) return
-
-    coin.setActive(true)
-    coin.setVisible(true)
-    coin.setPosition(x, -20)
-    coin.setDepth(5)
-    coin.setVelocityY(120)
-  }
-
-  private cleanupOffscreenObjects(): void {
-    const bottom = GAME_CONFIG.height + 60
-
-    this.enemies.getChildren().forEach((obj) => {
-      const sprite = obj as Phaser.Physics.Arcade.Sprite
-      if (sprite.active && sprite.y > bottom) {
-        sprite.destroy()
+    // Add initial cells on the chosen edge
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (
+          (lane === 'top' && r === 0) ||
+          (lane === 'bottom' && r === size - 1) ||
+          (lane === 'left' && c === 0) ||
+          (lane === 'right' && c === size - 1)
+        ) {
+          if (this.grid[r][c] && this.grid[r][c].color === color && !this.grid[r][c].filled) {
+            q.push({row: r, col: c})
+            visited.add(`${r},${c}`)
+          }
+        }
       }
-    })
+    }
 
-    this.coins.getChildren().forEach((obj) => {
-      const sprite = obj as Phaser.Physics.Arcade.Sprite
-      if (sprite.active && sprite.y > bottom) {
-        sprite.destroy()
+    // BFS
+    while(q.length > 0 && result.length < capacity) {
+      const curr = q.shift()!
+      result.push(curr)
+
+      const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]]
+      for (const [dr, dc] of dirs) {
+        const nr = curr.row + dr
+        const nc = curr.col + dc
+        if (nr >= 0 && nr < size && nc >= 0 && nc < size) {
+          if (this.grid[nr][nc] && this.grid[nr][nc].color === color && !this.grid[nr][nc].filled && !visited.has(`${nr},${nc}`)) {
+            visited.add(`${nr},${nc}`)
+            q.push({row: nr, col: nc})
+          }
+        }
       }
-    })
+    }
+    return result
   }
 
-  // ─── HUD ──────────────────────────────────────────────────────────────────
+  private checkPhaseEnd(): void {
+    const phaseConf = BALANCING.PHASES[this.currentPhaseIndex]
+    const size = phaseConf.gridSize
+    const totalCells = size * size
+
+    let filledCells = 0
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (this.grid[r][c].filled) filledCells++
+      }
+    }
+
+    const fillRatio = filledCells / totalCells
+    const availableCarts = this.carts.filter(c => !c.used)
+
+    if (fillRatio >= phaseConf.targetFill) {
+      // Phase Success
+      const unusedCount = availableCarts.length
+      if (unusedCount > 0) {
+        this.scoreSystem.add(unusedCount * BALANCING.pointsPerUnusedCart)
+      }
+      this.showMessage(`PHASE COMPLETE!\n+${unusedCount * BALANCING.pointsPerUnusedCart} Bonus`, 2000)
+      
+      this.time.delayedCall(2000, () => {
+        this.startPhase(this.currentPhaseIndex + 1)
+      })
+    } else {
+      // Check if literally no moves are left
+      let possibleMoves = false
+      if (availableCarts.length > 0) {
+        for (const cart of availableCarts) {
+          for (const lane of ['top', 'bottom', 'left', 'right'] as Lane[]) {
+            const cells = this.getFillableCells(cart.color, cart.capacity, lane)
+            if (cells.length > 0) {
+              possibleMoves = true
+              break
+            }
+          }
+          if (possibleMoves) break
+        }
+      }
+
+      if (!possibleMoves) {
+        // Game Over
+        this.triggerGameOver()
+      }
+    }
+  }
+
+  // ─── HUD / Effects ────────────────────────────────────────────────────────
 
   private createHUD(): void {
-    // Score
-    this.scoreText = this.add
-      .text(CX, 30, 'Score: 0', {
-        fontSize: '22px',
-        fontFamily: 'Arial, sans-serif',
-        color: '#ffffff',
-        fontStyle: 'bold',
-        resolution: 2
-      })
-      .setOrigin(0.5, 0)
-      .setDepth(20)
+    this.scoreText = this.add.text(CX, 30, 'Score: 0', {
+      fontSize: '22px',
+      fontFamily: 'Arial, sans-serif',
+      color: '#ffffff',
+      fontStyle: 'bold'
+    }).setOrigin(0.5, 0).setDepth(20)
 
-    // Lives
-    this.livesText = this.add
-      .text(GAME_CONFIG.width - 16, 16, `❤️ ${this.lives}`, {
-        fontSize: '20px',
-        fontFamily: 'Arial, sans-serif',
-        color: '#e74c3c',
-        resolution: 2
-      })
-      .setOrigin(1, 0)
-      .setDepth(20)
+    this.phaseText = this.add.text(16, 16, 'Phase 1', {
+      fontSize: '20px',
+      fontFamily: 'Arial, sans-serif',
+      color: '#e74c3c'
+    }).setDepth(20)
 
-    // Mute indicator (top left)
-    const muteIndicator = this.add
-      .text(16, 16, AudioManager.muted ? '🔇' : '🔊', {
-        fontSize: '24px',
-        resolution: 2
-      })
-      .setDepth(20)
-      .setInteractive({ useHandCursor: true })
+    this.messageText = this.add.text(CX, CY, '', {
+      fontSize: '24px',
+      fontFamily: 'Arial, sans-serif',
+      color: '#f1c40f',
+      fontStyle: 'bold',
+      align: 'center'
+    }).setOrigin(0.5).setDepth(30).setAlpha(0)
 
-    muteIndicator.on('pointerdown', () => {
-      AudioManager.toggleMute()
-      muteIndicator.setText(AudioManager.muted ? '🔇' : '🔊')
-    })
+    // Pause functionality could be preserved if wanted, but removing here for puzzle simplicity.
   }
 
   private updateHUD(): void {
     this.scoreText.setText(`Score: ${formatScore(this.scoreSystem.getScore())}`)
-    this.livesText.setText(`❤️ ${this.lives}`)
   }
 
-  // ─── Pause ────────────────────────────────────────────────────────────────
+  private showMessage(msg: string, duration: number = 1000): void {
+    this.messageText.setText(msg)
+    this.messageText.setAlpha(1)
+    this.messageText.setScale(0.8)
 
-  private createPauseOverlay(): void {
-    this.pauseOverlay = this.add.container(0, 0)
-    this.pauseOverlay.setDepth(50)
-    this.pauseOverlay.setVisible(false)
-
-    // Dimmer
-    const dim = this.add.rectangle(
-      CX,
-      GAME_CONFIG.height / 2,
-      GAME_CONFIG.width,
-      GAME_CONFIG.height,
-      0x000000,
-      0.6
-    )
-    const pauseText = this.add
-      .text(CX, GAME_CONFIG.height / 2 - 40, 'PAUSED', {
-        fontSize: '40px',
-        fontFamily: 'Arial, sans-serif',
-        color: '#ffffff',
-        fontStyle: 'bold',
-        resolution: 2
-      })
-      .setOrigin(0.5)
-
-    const resumeHint = this.add
-      .text(CX, GAME_CONFIG.height / 2 + 20, 'Press Escape to resume', {
-        fontSize: '18px',
-        fontFamily: 'Arial, sans-serif',
-        color: '#aaaacc',
-        resolution: 2
-      })
-      .setOrigin(0.5)
-
-    this.pauseOverlay.add([dim, pauseText, resumeHint])
-  }
-
-  private togglePause(): void {
-    this.isPaused = !this.isPaused
-    this.pauseOverlay.setVisible(this.isPaused)
-    this.spawnSystem.isPaused ? this.spawnSystem.resume() : this.spawnSystem.pause()
-    this.physics.world.isPaused ? this.physics.resume() : this.physics.pause()
-  }
-
-  // ─── Input ────────────────────────────────────────────────────────────────
-
-  private setupInput(): void {
-    this.cursors = this.input.keyboard!.createCursorKeys()
-    this.wasdKeys = {
-      up: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.W),
-      down: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.S),
-      left: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.A),
-      right: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.D)
-    }
-    this.escapeKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.ESC)
-    this.escapeKey.on('down', this.togglePause, this)
-
-    // Touch / pointer movement
-    this.input.on(Phaser.Input.Events.POINTER_DOWN, (ptr: Phaser.Input.Pointer) => {
-      this.pointerDown = true
-      this.pointerX = ptr.x
-    })
-    this.input.on(Phaser.Input.Events.POINTER_MOVE, (ptr: Phaser.Input.Pointer) => {
-      if (ptr.isDown) this.pointerX = ptr.x
-    })
-    this.input.on(Phaser.Input.Events.POINTER_UP, () => {
-      this.pointerDown = false
+    this.tweens.killTweensOf(this.messageText)
+    this.tweens.add({
+      targets: this.messageText,
+      scale: 1,
+      duration: 200,
+      ease: 'Back.easeOut',
+      onComplete: () => {
+        this.tweens.add({
+          targets: this.messageText,
+          alpha: 0,
+          delay: duration,
+          duration: 300
+        })
+      }
     })
   }
 
   // ─── Game Over ────────────────────────────────────────────────────────────
 
   private triggerGameOver(): void {
+    if (this.isGameOver) return;
     this.isGameOver = true
-    this.spawnSystem.clear()
-    this.physics.pause()
 
-    // TODO: analytics hook — game_over, score: this.scoreSystem.getScore()
+    this.showMessage("NO MOVES LEFT!", 2000)
 
     this.cameras.main.shake(300, 0.012)
-    this.time.delayedCall(600, () => {
+    this.time.delayedCall(2000, () => {
       this.cameras.main.fadeOut(BALANCING.sceneFadeDuration, 0, 0, 0)
-      this.cameras.main.once(
-        Phaser.Cameras.Scene2D.Events.FADE_OUT_COMPLETE,
-        () => {
-          this.scene.start('ResultScene', {
-            score: this.scoreSystem.getScore(),
-            highScore: this.scoreSystem.getHighScore(),
-            isNewHighScore: this.scoreSystem.isNewHighScore()
-          })
-        }
-      )
+      this.cameras.main.once(Phaser.Cameras.Scene2D.Events.FADE_OUT_COMPLETE, () => {
+        this.scene.start('ResultScene', {
+          score: this.scoreSystem.getScore(),
+          highScore: this.scoreSystem.getHighScore(),
+          isNewHighScore: this.scoreSystem.isNewHighScore()
+        })
+      })
     })
   }
 
-  // ─── Cleanup ──────────────────────────────────────────────────────────────
-
   shutdown(): void {
-    this.spawnSystem.clear()
-    this.escapeKey?.destroy()
-    this.input.off(Phaser.Input.Events.POINTER_DOWN)
-    this.input.off(Phaser.Input.Events.POINTER_MOVE)
-    this.input.off(Phaser.Input.Events.POINTER_UP)
+    this.input.off('pointerdown')
+    this.tweens.killAll()
   }
 }

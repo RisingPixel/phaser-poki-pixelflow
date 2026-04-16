@@ -121,26 +121,35 @@ export class PreloadScene extends Phaser.Scene {
   private loadAssets(): void {
     // ── Placeholder textures (generated at runtime — no files needed) ────────
 
-    // Player — blue rounded square
-    const playerGfx = this.make.graphics({ x: 0, y: 0 }, false)
-    playerGfx.fillStyle(0x4a90d9)
-    playerGfx.fillRoundedRect(0, 0, 48, 48, 10)
-    playerGfx.generateTexture('player', 48, 48)
-    playerGfx.destroy()
+    // Cell Empty — hollow square
+    const cellEmptyGfx = this.make.graphics({ x: 0, y: 0 }, false)
+    cellEmptyGfx.lineStyle(2, 0x444444)
+    cellEmptyGfx.strokeRoundedRect(2, 2, 44, 44, 6)
+    cellEmptyGfx.generateTexture('cell_empty', 48, 48)
+    cellEmptyGfx.destroy()
 
-    // Enemy — red rounded square
-    const enemyGfx = this.make.graphics({ x: 0, y: 0 }, false)
-    enemyGfx.fillStyle(0xe74c3c)
-    enemyGfx.fillRoundedRect(0, 0, 40, 40, 8)
-    enemyGfx.generateTexture('enemy', 40, 40)
-    enemyGfx.destroy()
+    // Cell Filled — solid white, ready to tint
+    const cellFilledGfx = this.make.graphics({ x: 0, y: 0 }, false)
+    cellFilledGfx.fillStyle(0xffffff)
+    cellFilledGfx.fillRoundedRect(0, 0, 48, 48, 6)
+    cellFilledGfx.generateTexture('cell_filled', 48, 48)
+    cellFilledGfx.destroy()
 
-    // Coin / collectible — gold circle
-    const coinGfx = this.make.graphics({ x: 0, y: 0 }, false)
-    coinGfx.fillStyle(0xf1c40f)
-    coinGfx.fillCircle(16, 16, 16)
-    coinGfx.generateTexture('coin', 32, 32)
-    coinGfx.destroy()
+    // Cart — Rounded rect
+    const cartGfx = this.make.graphics({ x: 0, y: 0 }, false)
+    cartGfx.fillStyle(0xffffff)
+    cartGfx.fillRoundedRect(0, 0, 80, 50, 8)
+    cartGfx.lineStyle(4, 0xffffff, 0.4)
+    cartGfx.strokeRoundedRect(0, 0, 80, 50, 8)
+    cartGfx.generateTexture('cart', 80, 50)
+    cartGfx.destroy()
+
+    // Lane Button
+    const laneGfx = this.make.graphics({ x: 0, y: 0 }, false)
+    laneGfx.fillStyle(0x333344)
+    laneGfx.fillRect(0, 0, 60, 60)
+    laneGfx.generateTexture('lane_button', 60, 60)
+    laneGfx.destroy()
 
     // Particle — small white dot (used for effects)
     const particleGfx = this.make.graphics({ x: 0, y: 0 }, false)

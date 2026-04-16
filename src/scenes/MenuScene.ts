@@ -73,7 +73,7 @@ export class MenuScene extends Phaser.Scene {
 
     // Tagline — replace with your game's actual tagline
     this.add
-      .text(CX, CY - 100, 'Tap to survive', {
+      .text(CX, CY - 100, 'Strategize and fill', {
         fontSize: '20px',
         fontFamily: 'Arial, sans-serif',
         color: '#aaaacc',
